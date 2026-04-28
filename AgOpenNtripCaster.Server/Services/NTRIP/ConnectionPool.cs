@@ -85,6 +85,14 @@ public class ConnectionPool
             return false;
         }
 
+        var sourceForMount = _sourceConnections.Values
+            .Any(s => s.MountPointName == mountPointName && !s.IsDisconnected);
+        if (sourceForMount)
+        {
+            _logger.LogWarning("Active source already exists for mount point {MountPointName}", mountPointName);
+            return false;
+        }
+
         var info = new SourceConnectionInfo
         {
             Id = sourceId,

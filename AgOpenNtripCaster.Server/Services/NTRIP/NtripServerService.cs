@@ -264,33 +264,42 @@ public class NtripServerService : IHostedService
         {
             using (tcpClient)
             using (var stream = tcpClient.GetStream())
-            using (var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true))
             {
-                // Read first line to determine connection type
-                string? requestLine = await reader.ReadLineAsync(cancellationToken);
-                if (string.IsNullOrEmpty(requestLine))
+                NtripRequest request;
+                try
                 {
-                    _logger.LogWarning("Empty request from {ClientId}", clientId);
+                    request = await NtripRequestParser.ReadAsync(stream, cancellationToken);
+                }
+                catch (InvalidDataException ex)
+                {
+                    _logger.LogWarning(ex, "Invalid NTRIP request from {ClientId}", clientId);
+                    await SendResponseAsync(stream, $"HTTP/1.1 400 Bad Request{NtripProtocol.CrLf}{NtripProtocol.CrLf}", cancellationToken);
                     return;
                 }
 
-                _logger.LogInformation("Received request from {ClientId}: {Request}", clientId, requestLine);
+                _logger.LogInformation(
+                    "Received request from {ClientId}: {Method} {Path}",
+                    clientId,
+                    request.Method,
+                    request.Path);
 
                 // Determine connection type
-                if (requestLine.StartsWith("SOURCE"))
+                if (request.Method == "SOURCE")
                 {
-                    // GNSS station connection
-                    await HandleSourceConnectionAsync(clientId, tcpClient, reader, requestLine, cancellationToken);
+                    await HandleSourceConnectionAsync(clientId, tcpClient, stream, request, useChunkedBody: false, cancellationToken);
                 }
-                else if (requestLine.StartsWith("GET"))
+                else if (request.Method == "POST")
                 {
-                    // Client connection
-                    await HandleClientConnectionAsync(clientId, tcpClient, reader, requestLine, cancellationToken);
+                    await HandleSourceConnectionAsync(clientId, tcpClient, stream, request, useChunkedBody: true, cancellationToken);
+                }
+                else if (request.Method == "GET")
+                {
+                    await HandleClientConnectionAsync(clientId, tcpClient, stream, request, cancellationToken);
                 }
                 else
                 {
-                    _logger.LogWarning("Unknown request type from {ClientId}: {Request}", clientId, requestLine);
-                    await SendResponseAsync(stream, "400 Bad Request\r\n\r\n", cancellationToken);
+                    _logger.LogWarning("Unknown request type from {ClientId}: {Method}", clientId, request.Method);
+                    await SendResponseAsync(stream, $"HTTP/1.1 400 Bad Request{NtripProtocol.CrLf}{NtripProtocol.CrLf}", cancellationToken);
                 }
             }
         }
@@ -312,46 +321,50 @@ public class NtripServerService : IHostedService
     private async Task HandleSourceConnectionAsync(
         string sourceId,
         TcpClient tcpClient,
-        StreamReader reader,
-        string requestLine,
+        NetworkStream stream,
+        NtripRequest request,
+        bool useChunkedBody,
         CancellationToken cancellationToken)
     {
-        string? mountPointName = null;
+        string? mountPointName = request.MountPoint;
         try
         {
-            // Parse: "SOURCE password mountpoint"
-            var parts = requestLine.Split(' ');
-            if (parts.Length < 3)
+            if (string.IsNullOrEmpty(mountPointName))
             {
-                _logger.LogWarning("Invalid SOURCE format from {ClientId}: {Request}", sourceId, requestLine);
-                await SendResponseAsync(tcpClient.GetStream(), "HTTP/1.1 400 Bad Request\r\n\r\n", cancellationToken);
+                _logger.LogWarning("Source request from {ClientId} did not include a mountpoint", sourceId);
+                await SendSourceErrorAsync(stream, request, "400 Bad Request", cancellationToken);
                 return;
             }
 
-            var password = parts[1];
-            mountPointName = parts[2];
+            var password = request.Method == "SOURCE" ? request.SourcePassword : request.BasicPassword;
+            if (string.IsNullOrEmpty(password))
+            {
+                await SendSourceErrorAsync(stream, request, "401 Unauthorized", cancellationToken);
+                return;
+            }
 
             // Authenticate source
             using var scope = _serviceProvider.CreateScope();
             var authService = scope.ServiceProvider.GetRequiredService<NtripAuthenticationService>();
-            var mountPoint = await authService.AuthenticateSourceAsync(mountPointName, password);
+            var mountPoint = await authService.AuthenticateSourceAsync(mountPointName, password, request.BasicUsername);
 
             if (mountPoint == null)
             {
-                await SendResponseAsync(tcpClient.GetStream(), "HTTP/1.1 401 Unauthorized\r\n\r\n", cancellationToken);
+                await SendSourceErrorAsync(stream, request, "401 Unauthorized", cancellationToken);
                 return;
             }
+
+            mountPointName = mountPoint.Name;
 
             // Register source
             if (!_connectionPool.RegisterSource(sourceId, mountPointName, tcpClient))
             {
-                await SendResponseAsync(tcpClient.GetStream(), "HTTP/1.1 503 Service Unavailable\r\n\r\n", cancellationToken);
+                await SendSourceErrorAsync(stream, request, "503 Service Unavailable", cancellationToken);
                 return;
             }
 
             // Send success response
-            // Sources expect a simple "OK" response (not HTTP format)
-            await SendResponseAsync(tcpClient.GetStream(), "OK\r\n", cancellationToken);
+            await SendSourceSuccessAsync(stream, request, cancellationToken);
 
             // Create SourceConnection in database
             var sourceConnectionId = await CreateSourceConnectionAsync(mountPointName, cancellationToken);
@@ -366,7 +379,14 @@ public class NtripServerService : IHostedService
             }
 
             // Broadcast source data directly to all connected clients using zero-copy SharedRtcmBuffer
-            await HandleSourceStreamAsync(sourceId, reader, tcpClient.GetStream(), mountPointName, cancellationToken);
+            if (useChunkedBody)
+            {
+                await HandleSourceStreamChunkedAsync(sourceId, stream, mountPointName, cancellationToken);
+            }
+            else
+            {
+                await HandleSourceStreamRawAsync(sourceId, stream, mountPointName, cancellationToken);
+            }
         }
         catch (Exception ex)
         {
@@ -395,50 +415,31 @@ public class NtripServerService : IHostedService
     private async Task HandleClientConnectionAsync(
         string clientId,
         TcpClient tcpClient,
-        StreamReader reader,
-        string requestLine,
+        NetworkStream stream,
+        NtripRequest request,
         CancellationToken cancellationToken)
     {
-        string? mountPointName = null;
+        string? mountPointName = request.MountPoint;
         try
         {
-            // Parse: "GET /STATION_A HTTP/1.1"
-            var parts = requestLine.Split(' ');
-            if (parts.Length < 2)
+            // Empty path = sourcetable request
+            if (request.IsSourcetableRequest)
             {
-                await SendResponseAsync(tcpClient.GetStream(), "HTTP/1.1 400 Bad Request\r\n\r\n", cancellationToken);
+                await HandleSourcetableRequestAsync(stream, cancellationToken);
                 return;
             }
 
-            var mountPointPath = parts[1];
-            mountPointName = mountPointPath.TrimStart('/');
-
-            // Empty path = sourcetable request
             if (string.IsNullOrEmpty(mountPointName))
             {
-                await HandleSourcetableRequestAsync(tcpClient.GetStream(), cancellationToken);
+                await SendResponseAsync(stream, $"HTTP/1.1 400 Bad Request{NtripProtocol.CrLf}{NtripProtocol.CrLf}", cancellationToken);
                 return;
-            }
-
-            // Read Authorization header
-            string? authHeader = null;
-            string? line;
-            while ((line = await reader.ReadLineAsync(cancellationToken)) != null)
-            {
-                if (string.IsNullOrEmpty(line))
-                    break; // End of headers
-
-                if (line.StartsWith("Authorization:", StringComparison.OrdinalIgnoreCase))
-                {
-                    authHeader = line;
-                }
             }
 
             // Extract credentials from Basic auth
-            (string? username, string? password) = ExtractBasicAuth(authHeader);
+            (string? username, string? password) = (request.BasicUsername, request.BasicPassword);
             if (username == null || password == null)
             {
-                await SendResponseAsync(tcpClient.GetStream(), "HTTP/1.1 401 Unauthorized\r\n\r\n", cancellationToken);
+                await SendResponseAsync(stream, $"HTTP/1.1 401 Unauthorized{NtripProtocol.CrLf}{NtripProtocol.CrLf}", cancellationToken);
                 return;
             }
 
@@ -449,28 +450,29 @@ public class NtripServerService : IHostedService
 
             if (!authResult.Success)
             {
-                await SendResponseAsync(tcpClient.GetStream(), "HTTP/1.1 401 Unauthorized\r\n\r\n", cancellationToken);
+                await SendResponseAsync(stream, $"HTTP/1.1 401 Unauthorized{NtripProtocol.CrLf}{NtripProtocol.CrLf}", cancellationToken);
                 return;
             }
+
+            mountPointName = authResult.MountPoint?.Name ?? mountPointName;
 
             // Register client
             if (!_connectionPool.RegisterClient(clientId, mountPointName, username, tcpClient))
             {
-                await SendResponseAsync(tcpClient.GetStream(), "HTTP/1.1 503 Service Unavailable\r\n\r\n", cancellationToken);
+                await SendResponseAsync(stream, $"HTTP/1.1 503 Service Unavailable{NtripProtocol.CrLf}{NtripProtocol.CrLf}", cancellationToken);
                 return;
             }
 
             // Send success response with proper NTRIP headers
             // ICY 200 OK is used for streaming connections (NTRIP protocol)
-            var responseBuilder = new StringBuilder();
-            responseBuilder.AppendLine("ICY 200 OK");
-            responseBuilder.AppendLine("Server: AgOpen NtripCaster/1.0");
-            responseBuilder.AppendLine("Content-Type: application/octet-stream");
-            responseBuilder.AppendLine("Ntrip-Version: Ntrip/2.0");
-            responseBuilder.AppendLine();
-
-            var response = Encoding.ASCII.GetBytes(responseBuilder.ToString());
-            await tcpClient.GetStream().WriteAsync(response, 0, response.Length, cancellationToken);
+            var response = string.Join(NtripProtocol.CrLf,
+                "ICY 200 OK",
+                "Server: AgOpenNtripCaster/1.0",
+                "Content-Type: gnss/data",
+                "Ntrip-Version: Ntrip/2.0",
+                "",
+                "");
+            await SendResponseAsync(stream, response, cancellationToken);
 
             // Create ClientSession in database
             var clientIpAddress = (tcpClient.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString();
@@ -491,7 +493,8 @@ public class NtripServerService : IHostedService
                 clientId, username, mountPointName, _mountPointClientCounts[mountPointName]);
 
             // Stream RTCM data to client using zero-copy SharedRtcmBuffer from channel
-            await HandleClientStreamAsync(clientId, reader, tcpClient.GetStream(), mountPointName, cancellationToken);
+            using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
+            await HandleClientStreamAsync(clientId, reader, stream, mountPointName, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -523,16 +526,15 @@ public class NtripServerService : IHostedService
     /// <summary>
     /// Handle source streaming - read RTCM from source, create SharedRtcmBuffer, broadcast to all clients (zero-copy)
     /// </summary>
-    private async Task HandleSourceStreamAsync(
+    private async Task HandleSourceStreamRawAsync(
         string sourceId,
-        StreamReader reader,
         NetworkStream stream,
         string mountPointName,
         CancellationToken cancellationToken)
     {
         var buffer = new byte[8192];
         var rtcmBuffer = new List<byte>();  // Buffer for collecting RTCM message chunks
-        _logger.LogInformation("Source {SourceId} starting zero-copy stream for {MountPoint}", sourceId, mountPointName);
+        _logger.LogInformation("Source {SourceId} starting raw zero-copy stream for {MountPoint}", sourceId, mountPointName);
 
         try
         {
@@ -546,54 +548,7 @@ public class NtripServerService : IHostedService
                     break;
                 }
 
-                // Create data copy for this broadcast
-                var data = buffer.AsSpan(0, bytesRead).ToArray();
-
-                // Parse RTCM messages for station position extraction
-                rtcmBuffer.AddRange(data);
-                await ParseRtcmMessagesAsync(rtcmBuffer, mountPointName, cancellationToken);
-
-                // Get all active clients for this mount point
-                var clients = _connectionPool.GetClientsForMountPoint(mountPointName);
-
-                if (clients.Count > 0)
-                {
-                    // Create shared buffer (SINGLE allocation for ALL clients)
-                    using var sharedBuffer = new SharedRtcmBuffer(data);
-
-                    // Add reference for each client (total refCount = clients.Count)
-                    for (int i = 1; i < clients.Count; i++)
-                    {
-                        sharedBuffer.AddRef();
-                    }
-
-                    // Broadcast to all clients concurrently (zero-copy!)
-                    var broadcastTasks = new List<Task>();
-                    foreach (var client in clients)
-                    {
-                        // Try to write buffer to client's channel (non-blocking)
-                        if (client.BufferChannel.Writer.TryWrite(sharedBuffer))
-                        {
-                            client.PendingBufferCount++;
-                        }
-                        else
-                        {
-                            // Channel full - client is too slow, buffer will be dropped
-                            _logger.LogWarning("Client {ClientId} channel full, dropping buffer (slow client)", client.Id);
-                            sharedBuffer.Release(); // Release our reference since we didn't enqueue
-                        }
-                    }
-
-                    _logger.LogDebug("Broadcasted {Bytes} bytes to {Count} clients via SharedRtcmBuffer", bytesRead, clients.Count);
-                }
-
-                // Update source statistics
-                var sourceConnection = _connectionPool.GetSourceForMountPoint(mountPointName);
-                if (sourceConnection != null)
-                {
-                    sourceConnection.BytesReceived += bytesRead;
-                    sourceConnection.LastActivityAt = DateTime.UtcNow;
-                }
+                await BroadcastRtcmAsync(sourceId, mountPointName, buffer.AsMemory(0, bytesRead), rtcmBuffer, cancellationToken);
             }
         }
         catch (OperationCanceledException)
@@ -603,6 +558,97 @@ public class NtripServerService : IHostedService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error in source stream {SourceId}", sourceId);
+        }
+    }
+
+    private async Task HandleSourceStreamChunkedAsync(
+        string sourceId,
+        NetworkStream stream,
+        string mountPointName,
+        CancellationToken cancellationToken)
+    {
+        var rtcmBuffer = new List<byte>();
+        _logger.LogInformation("Source {SourceId} starting chunked zero-copy stream for {MountPoint}", sourceId, mountPointName);
+
+        try
+        {
+            await NtripChunkedStreamReader.ReadChunksAsync(
+                stream,
+                (payload, ct) => new ValueTask(BroadcastRtcmAsync(sourceId, mountPointName, payload, rtcmBuffer, ct)),
+                cancellationToken);
+
+            _logger.LogInformation("Source {SourceId} chunked stream ended", sourceId);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("Source {SourceId} chunked stream cancelled", sourceId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error in chunked source stream {SourceId}", sourceId);
+        }
+    }
+
+    private async Task BroadcastRtcmAsync(
+        string sourceId,
+        string mountPointName,
+        ReadOnlyMemory<byte> payload,
+        List<byte> rtcmBuffer,
+        CancellationToken cancellationToken)
+    {
+        if (payload.Length == 0)
+            return;
+
+        var data = payload.ToArray();
+
+        // Parse RTCM messages for station position extraction
+        rtcmBuffer.AddRange(data);
+        await ParseRtcmMessagesAsync(rtcmBuffer, mountPointName, cancellationToken);
+
+        var clients = _connectionPool.GetClientsForMountPoint(mountPointName);
+        if (clients.Count > 0)
+        {
+            var sharedBuffer = new SharedRtcmBuffer(data);
+            var enqueuedCount = 0;
+
+            try
+            {
+                foreach (var client in clients)
+                {
+                    sharedBuffer.AddRef();
+
+                    if (client.BufferChannel.Writer.TryWrite(sharedBuffer))
+                    {
+                        client.PendingBufferCount++;
+                        enqueuedCount++;
+                    }
+                    else
+                    {
+                        sharedBuffer.Release();
+
+                        _logger.LogWarning("Client {ClientId} channel full, dropping buffer (slow client)", client.Id);
+                    }
+                }
+            }
+            finally
+            {
+                // Keep the producer reference alive until every client has either
+                // accepted or rejected its own reference.
+                sharedBuffer.Release();
+            }
+
+            _logger.LogDebug(
+                "Broadcasted {Bytes} bytes from source {SourceId} to {Count} clients via SharedRtcmBuffer",
+                payload.Length,
+                sourceId,
+                enqueuedCount);
+        }
+
+        var sourceConnection = _connectionPool.GetSourceForMountPoint(mountPointName);
+        if (sourceConnection != null)
+        {
+            sourceConnection.BytesReceived += payload.Length;
+            sourceConnection.LastActivityAt = DateTime.UtcNow;
         }
     }
 
@@ -1005,22 +1051,10 @@ public class NtripServerService : IHostedService
                 .Where(m => m.IsActive)
                 .ToListAsync();
 
-            // Filter: Only include mount points that have CONNECTED sources
-            var connectedMountPoints = new List<Models.Entities.MountPoint>();
-            foreach (var mp in allMountPoints)
-            {
-                var source = _connectionPool.GetSourceForMountPoint(mp.Name);
-                // Only include if source is connected (not disconnected)
-                if (source != null && !source.IsDisconnected)
-                {
-                    connectedMountPoints.Add(mp);
-                }
-            }
-
-            var sb = new StringBuilder();
+            var lines = new List<string>();
 
             // NTRIP 2.0 sourcetable format
-            sb.AppendLine("SOURCETABLE 2.0");
+            lines.Add("SOURCETABLE 200 OK");
 
             // Get CAS and NET info from database
             var casterInfo = await dbContext.CasterInfos.FirstOrDefaultAsync(cancellationToken);
@@ -1030,36 +1064,37 @@ public class NtripServerService : IHostedService
             // CAS;identifier;operator;nmea;country;lat;lon;fallback_host;port;misc
             if (casterInfo != null)
             {
-                sb.AppendLine(
+                lines.Add(
                     $"CAS;{casterInfo.Identifier};{casterInfo.Operator};{casterInfo.NmeaSupport};{casterInfo.Country};{casterInfo.Latitude:F1};{casterInfo.Longitude:F1};{casterInfo.FallbackHost ?? ""};{casterInfo.Port};{casterInfo.Description}");
             }
             else
             {
                 // Fallback if no config found
                 _logger.LogWarning("No CasterInfo configured, using defaults for sourcetable");
-                sb.AppendLine("CAS;agopencast;AgOpenNtripCaster;0;NL;52.0;5.0;;2101;AgOpen GNSS RTK Server");
+                lines.Add("CAS;agopencast;AgOpenNtripCaster;0;FI;60.0;24.0;;2101;AgOpen GNSS RTK Server");
             }
 
             // NET entry (Network Info) - optional but recommended
             // NET;identifier;operator;auth;fee;website;email;startdate;enddate
             if (networkInfo != null)
             {
-                sb.AppendLine(
+                lines.Add(
                     $"NET;{networkInfo.Identifier};{networkInfo.Operator};{networkInfo.AuthenticationRequired};{networkInfo.FeeRequired};{networkInfo.Website};{networkInfo.Email};{networkInfo.StartDate:yyyy-MM-dd};{networkInfo.EndDate:yyyy-MM-dd}");
             }
             else
             {
                 // Fallback if no config found
                 _logger.LogWarning("No NetworkInfo configured, using defaults for sourcetable");
-                sb.AppendLine("NET;NTRIP;AgOpenNtripCaster;Y;N;https://github.com/AgOpenGPS;info@agopenrtk.local;2025-01-01;2026-12-31");
+                lines.Add("NET;NTRIP;AgOpenNtripCaster;Y;N;https://github.com/AgOpenGPS;info@agopenrtk.local;2025-01-01;2026-12-31");
             }
 
-            // STR entries - ONLY for connected sources
-            foreach (var mp in connectedMountPoints)
+            // STR entries - include configured active mount points so AgOpenGPS can select
+            // the stream before the base station source has connected.
+            foreach (var mp in allMountPoints)
             {
                 // Use RTCM-extracted coordinates if available, otherwise fallback to static coordinates
-                var latitude = mp.RtcmLatitude ?? mp.Latitude;
-                var longitude = mp.RtcmLongitude ?? mp.Longitude;
+                var latitude = mp.RtcmLatitude ?? mp.Latitude ?? 0m;
+                var longitude = mp.RtcmLongitude ?? mp.Longitude ?? 0m;
 
                 // NTRIP 2.0 Sourcetable format:
                 // STR;mountpoint;identifier;format;format-details;carrier;nav-system;network;country;lat;lon;nmea;solution;generator;compression;auth;fee;bitrate;misc
@@ -1079,38 +1114,53 @@ public class NtripServerService : IHostedService
                 var bitrate = mp.BytesPerSecond ?? 5000;
                 var misc = mp.Misc ?? "";
 
-                sb.AppendLine(
+                lines.Add(
                     $"STR;{mp.Name};{identifier};{format};{formatDetails};{carrier};{navSystems};{network};{country};{latitude:F2};{longitude:F2};{nmea};{solution};{generator};{compression};{auth};{fee};{bitrate};{misc}");
             }
 
-            sb.AppendLine("ENDSOURCETABLE");
+            lines.Add("ENDSOURCETABLE");
+            lines.Add(string.Empty);
 
-            var sourcetableData = sb.ToString();
-
-            // Send HTTP 200 response with sourcetable
-            // NTRIP 2.0 compatible headers (based on BKG Caster reference implementation)
-            var responseBuilder = new StringBuilder();
-            responseBuilder.AppendLine("HTTP/1.1 200 OK");
-            responseBuilder.AppendLine("Ntrip-Version: Ntrip/2.0");
-            responseBuilder.AppendLine("Ntrip-Flags: st_match,st_strict");
-            responseBuilder.AppendLine("Server: AgOpen NtripCaster/1.0");
-            responseBuilder.AppendLine($"Date: {DateTime.UtcNow:R}");
-            responseBuilder.AppendLine("Connection: close");
-            responseBuilder.AppendLine("Content-Type: text/plain");
-            responseBuilder.AppendLine($"Content-Length: {Encoding.ASCII.GetByteCount(sourcetableData)}");
-            responseBuilder.AppendLine();
-            responseBuilder.Append(sourcetableData);
-
-            var response = Encoding.ASCII.GetBytes(responseBuilder.ToString());
+            var response = Encoding.ASCII.GetBytes(string.Join(NtripProtocol.CrLf, lines));
             await stream.WriteAsync(response, 0, response.Length, cancellationToken);
 
-            _logger.LogInformation("Sourcetable sent with {Connected}/{Total} connected mount points",
-                connectedMountPoints.Count, allMountPoints.Count);
+            _logger.LogInformation("Sourcetable sent with {Total} active mount points", allMountPoints.Count);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error handling sourcetable request");
         }
+    }
+
+    private static Task SendSourceSuccessAsync(
+        NetworkStream stream,
+        NtripRequest request,
+        CancellationToken cancellationToken)
+    {
+        var response = request.Method == "POST"
+            ? string.Join(NtripProtocol.CrLf,
+                "HTTP/1.1 200 OK",
+                "Ntrip-Version: Ntrip/2.0",
+                "Server: AgOpenNtripCaster/1.0",
+                "Connection: close",
+                "",
+                "")
+            : string.Join(NtripProtocol.CrLf, "ICY 200 OK", "", "");
+
+        return SendResponseAsync(stream, response, cancellationToken);
+    }
+
+    private static Task SendSourceErrorAsync(
+        NetworkStream stream,
+        NtripRequest request,
+        string status,
+        CancellationToken cancellationToken)
+    {
+        var response = request.Method == "POST"
+            ? $"HTTP/1.1 {status}{NtripProtocol.CrLf}{NtripProtocol.CrLf}"
+            : $"ERROR - {status}{NtripProtocol.CrLf}";
+
+        return SendResponseAsync(stream, response, cancellationToken);
     }
 
     /// <summary>
