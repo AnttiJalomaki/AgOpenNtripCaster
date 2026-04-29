@@ -45,4 +45,5 @@ ehthumbs.db
 # Temp
 *.tmp
 temp/
+.worktrees/
 .superpowers/
