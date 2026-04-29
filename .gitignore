@@ -21,6 +21,7 @@ yarn-error.log*
 .env
 .env.local
 .env.*.local
+*.local.*
 
 # Logs
 logs/
@@ -44,3 +45,4 @@ ehthumbs.db
 # Temp
 *.tmp
 temp/
+.superpowers/
