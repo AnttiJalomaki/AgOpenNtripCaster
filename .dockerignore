@@ -13,3 +13,5 @@
 **/*.tar*
 **/*.pem
 **/*.key
+**/data-protection-keys
+**/.local

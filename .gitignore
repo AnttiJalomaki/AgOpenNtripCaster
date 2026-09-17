@@ -47,3 +47,7 @@ ehthumbs.db
 temp/
 .worktrees/
 .superpowers/
+
+# ASP.NET data-protection keys and local runtime state
+**/data-protection-keys/
+**/.local/
