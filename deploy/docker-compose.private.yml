@@ -75,6 +75,12 @@ services:
     security_opt: [no-new-privileges:true]
     mem_limit: 64m
     pids_limit: 64
+    healthcheck:
+      test: [CMD, wget, --quiet, --tries=1, --spider, 'http://127.0.0.1/']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     logging: *logging
     restart: unless-stopped
 volumes:
