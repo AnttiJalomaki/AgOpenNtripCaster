@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using AgOpenNtripCaster.Server.Models.DTOs;
 using AgOpenNtripCaster.Server.Services.Auth;
 
@@ -9,6 +10,7 @@ namespace AgOpenNtripCaster.Server.Controllers;
 /// </summary>
 [ApiController]
 [Route("api/[controller]")]
+[EnableRateLimiting("authentication")]
 public class AuthController : ControllerBase
 {
     private readonly IAuthService _authService;

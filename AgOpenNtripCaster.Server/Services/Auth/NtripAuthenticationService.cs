@@ -1,8 +1,9 @@
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using System.Security.Cryptography;
+using System.Text;
 using AgOpenNtripCaster.Server.Data;
 using AgOpenNtripCaster.Server.Models.Entities;
-using AgOpenNtripCaster.Server.Services.User;
 
 namespace AgOpenNtripCaster.Server.Services.Auth;
 
@@ -16,18 +17,15 @@ public class NtripAuthenticationService
 {
     private readonly ApplicationDbContext _dbContext;
     private readonly UserManager<NtripUser> _userManager;
-    private readonly ISourcePasswordService _sourcePasswordService;
     private readonly ILogger<NtripAuthenticationService> _logger;
 
     public NtripAuthenticationService(
         ApplicationDbContext dbContext,
         UserManager<NtripUser> userManager,
-        ISourcePasswordService sourcePasswordService,
         ILogger<NtripAuthenticationService> logger)
     {
         _dbContext = dbContext;
         _userManager = userManager;
-        _sourcePasswordService = sourcePasswordService;
         _logger = logger;
     }
 
@@ -35,10 +33,13 @@ public class NtripAuthenticationService
     /// Authenticate a GNSS station (source)
     /// Flow:
     /// 1. Username = MountPoint name (e.g., "BaseStationA")
-    /// 2. Password = User's unique source password
-    /// 3. Find mount point by name, get owner, verify source password
+    /// 2. Password = MountPoint.SourcePassword
+    /// 3. Optional NTRIP v2 username may be mount point name or owner username/email
     /// </summary>
-    public async Task<MountPoint?> AuthenticateSourceAsync(string mountPointName, string providedPassword)
+    public async Task<MountPoint?> AuthenticateSourceAsync(
+        string mountPointName,
+        string providedPassword,
+        string? providedUsername = null)
     {
         try
         {
@@ -52,29 +53,37 @@ public class NtripAuthenticationService
                 return null;
             }
 
-            // 2. Get mount point owner
-            if (string.IsNullOrEmpty(mountPoint.UserId))
+            NtripUser? owner = null;
+            if (!string.IsNullOrEmpty(mountPoint.UserId))
             {
-                _logger.LogWarning($"Source auth failed: Mount point '{mountPointName}' has no owner");
+                owner = await _userManager.FindByIdAsync(mountPoint.UserId);
+                if (owner == null || !owner.IsActive)
+                {
+                    _logger.LogWarning($"Source auth failed: Mount point owner for '{mountPointName}' not found or inactive");
+                    return null;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(providedUsername) && !SourceUsernameMatches(providedUsername, mountPoint, owner))
+            {
+                _logger.LogWarning(
+                    "Source auth failed: Username '{Username}' is not valid for mount point '{MountPoint}'",
+                    providedUsername,
+                    mountPointName);
                 return null;
             }
 
-            var owner = await _userManager.FindByIdAsync(mountPoint.UserId);
-            if (owner == null || !owner.IsActive)
-            {
-                _logger.LogWarning($"Source auth failed: Mount point owner for '{mountPointName}' not found or inactive");
-                return null;
-            }
-
-            // 3. Verify source password using SourcePasswordService (bcrypt)
-            var passwordValid = await _sourcePasswordService.VerifySourcePasswordAsync(owner.Id, providedPassword);
-            if (!passwordValid)
+            if (string.IsNullOrEmpty(mountPoint.SourcePassword) ||
+                !FixedTimeEquals(mountPoint.SourcePassword, providedPassword))
             {
                 _logger.LogWarning($"Source auth failed: Invalid source password for mount point '{mountPointName}'");
                 return null;
             }
 
-            _logger.LogInformation($"Source authenticated: {mountPointName} (owner: {owner.Email})");
+            _logger.LogInformation(
+                "Source authenticated: {MountPointName} (owner: {Owner})",
+                mountPointName,
+                owner?.Email ?? "admin");
             return mountPoint;
         }
         catch (Exception ex)
@@ -82,6 +91,27 @@ public class NtripAuthenticationService
             _logger.LogError(ex, $"Source authentication error for {mountPointName}");
             return null;
         }
+    }
+
+    private static bool SourceUsernameMatches(string providedUsername, MountPoint mountPoint, NtripUser? owner)
+    {
+        if (providedUsername.Equals(mountPoint.Name, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (owner == null)
+            return false;
+
+        return providedUsername.Equals(owner.UserName, StringComparison.OrdinalIgnoreCase) ||
+               providedUsername.Equals(owner.Email, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool FixedTimeEquals(string expected, string provided)
+    {
+        var expectedBytes = Encoding.UTF8.GetBytes(expected);
+        var providedBytes = Encoding.UTF8.GetBytes(provided);
+
+        return expectedBytes.Length == providedBytes.Length &&
+               CryptographicOperations.FixedTimeEquals(expectedBytes, providedBytes);
     }
 
     /// <summary>
@@ -152,8 +182,10 @@ public class NtripAuthenticationService
             if (allowedGroupIds.Count > 0)
             {
                 // Mount point is restricted to specific groups
-                var userGroups = user.Groups.Select(g => g.Id).ToHashSet();
-                var hasAccess = userGroups.Intersect(allowedGroupIds).Any();
+                var hasAccess = await _dbContext.Users
+                    .Where(u => u.Id == user.Id)
+                    .SelectMany(u => u.Groups)
+                    .AnyAsync(g => allowedGroupIds.Contains(g.Id));
 
                 if (!hasAccess)
                 {

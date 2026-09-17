@@ -143,13 +143,46 @@ namespace AgOpenNtripCaster.Server.Migrations
                     b.Property<string>("ClientIpAddress")
                         .HasColumnType("text");
 
+                    b.Property<string>("ClientUserAgent")
+                        .HasColumnType("text");
+
                     b.Property<DateTime>("ConnectedAt")
                         .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("DisconnectReason")
+                        .HasColumnType("text");
 
                     b.Property<DateTime?>("DisconnectedAt")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<DateTime?>("FirstGgaAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("GgaFrameCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("InvalidGgaFrameCount")
+                        .HasColumnType("integer");
+
                     b.Property<double?>("LastAccuracy")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("LastAltitudeMeters")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("LastDifferentialAgeSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<string>("LastDifferentialStationId")
+                        .HasColumnType("text");
+
+                    b.Property<int?>("LastFixQuality")
+                        .HasColumnType("integer");
+
+                    b.Property<double?>("LastGeoidSeparationMeters")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("LastHdop")
                         .HasColumnType("double precision");
 
                     b.Property<double?>("LastLatitude")
@@ -161,17 +194,29 @@ namespace AgOpenNtripCaster.Server.Migrations
                     b.Property<DateTime?>("LastPositionAt")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<int?>("LastSatelliteCount")
+                        .HasColumnType("integer");
+
                     b.Property<DateTime?>("LastStreamPauseAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<int>("MountPointId")
                         .HasColumnType("integer");
 
+                    b.Property<int>("PeakPendingBufferCount")
+                        .HasColumnType("integer");
+
                     b.Property<int>("SerialNumber")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("StalePositionPeriods")
                         .HasColumnType("integer");
 
                     b.Property<int>("Status")
                         .HasColumnType("integer");
+
+                    b.Property<double>("StreamPausedSeconds")
+                        .HasColumnType("double precision");
 
                     b.Property<string>("UserId")
                         .IsRequired()
@@ -179,11 +224,68 @@ namespace AgOpenNtripCaster.Server.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("ConnectedAt");
+
                     b.HasIndex("MountPointId");
+
+                    b.HasIndex("UserId", "ConnectedAt");
+
+                    b.ToTable("ClientSessions");
+                });
+
+            modelBuilder.Entity("AgOpenNtripCaster.Server.Models.Entities.DiagnosticEvent", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("ClientSessionId")
+                        .HasColumnType("text");
+
+                    b.Property<string>("DataJson")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Kind")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Message")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<int?>("MountPointId")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Severity")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<int?>("SourceConnectionId")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime>("Timestamp")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("UserId")
+                        .HasColumnType("text");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ClientSessionId");
+
+                    b.HasIndex("Kind");
+
+                    b.HasIndex("MountPointId");
+
+                    b.HasIndex("SourceConnectionId");
+
+                    b.HasIndex("Timestamp");
 
                     b.HasIndex("UserId");
 
-                    b.ToTable("ClientSessions");
+                    b.ToTable("DiagnosticEvents");
                 });
 
             modelBuilder.Entity("AgOpenNtripCaster.Server.Models.Entities.EmailSmtpSettings", b =>
@@ -621,16 +723,27 @@ namespace AgOpenNtripCaster.Server.Migrations
                     b.Property<DateTime>("ConnectedAt")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<string>("DisconnectReason")
+                        .HasColumnType("text");
+
                     b.Property<DateTime?>("DisconnectedAt")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<DateTime?>("LastRtcmAt")
+                        .HasColumnType("timestamp with time zone");
+
                     b.Property<int>("MountPointId")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("RtcmChunkCount")
                         .HasColumnType("integer");
 
                     b.Property<int>("Status")
                         .HasColumnType("integer");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("ConnectedAt");
 
                     b.HasIndex("MountPointId");
 
@@ -873,6 +986,37 @@ namespace AgOpenNtripCaster.Server.Migrations
                         .IsRequired();
 
                     b.Navigation("MountPoint");
+
+                    b.Navigation("User");
+                });
+
+            modelBuilder.Entity("AgOpenNtripCaster.Server.Models.Entities.DiagnosticEvent", b =>
+                {
+                    b.HasOne("AgOpenNtripCaster.Server.Models.Entities.ClientSession", "ClientSession")
+                        .WithMany()
+                        .HasForeignKey("ClientSessionId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.HasOne("AgOpenNtripCaster.Server.Models.Entities.MountPoint", "MountPoint")
+                        .WithMany()
+                        .HasForeignKey("MountPointId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.HasOne("AgOpenNtripCaster.Server.Models.Entities.SourceConnection", "SourceConnection")
+                        .WithMany()
+                        .HasForeignKey("SourceConnectionId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.HasOne("AgOpenNtripCaster.Server.Models.Entities.NtripUser", "User")
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.Navigation("ClientSession");
+
+                    b.Navigation("MountPoint");
+
+                    b.Navigation("SourceConnection");
 
                     b.Navigation("User");
                 });

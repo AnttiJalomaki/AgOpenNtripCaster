@@ -90,9 +90,7 @@ public class DatabaseSeeder : IDatabaseSeeder
         // Require admin password to be set via environment variable for security
         if (string.IsNullOrWhiteSpace(adminPassword))
         {
-            _logger.LogWarning(
-                "Admin password not configured. Set Admin:Password environment variable. Using default for development.");
-            adminPassword = "ChangeMe@12345";
+            throw new InvalidOperationException("Admin__Password must be configured before creating the initial administrator.");
         }
 
         var existingUser = await _userManager.FindByEmailAsync(adminEmail);

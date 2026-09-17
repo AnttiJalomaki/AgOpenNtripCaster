@@ -9,6 +9,9 @@ public class SourceConnection
     public long BytesReceived { get; set; }
     public long BytesSent { get; set; }
     public SourceConnectionStatus Status { get; set; } = SourceConnectionStatus.Connected;
+    public string? DisconnectReason { get; set; }
+    public DateTime? LastRtcmAt { get; set; }
+    public int RtcmChunkCount { get; set; }
 
     // Relations
     public MountPoint? MountPoint { get; set; }

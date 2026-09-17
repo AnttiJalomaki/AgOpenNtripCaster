@@ -60,11 +60,12 @@ public class UsersController : ControllerBase
     /// <param name="pageSize">Items per page (default: 10)</param>
     /// <returns>UserListResponse with paginated users</returns>
     [HttpGet]
+    [Authorize(Roles = "Admin")]
     [ProducesResponseType(typeof(UserListResponse), 200)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     public async Task<ActionResult<UserListResponse>> GetUsers([FromQuery] int page = 1, [FromQuery] int pageSize = 10)
     {
-        if (page < 1 || pageSize < 1)
+        if (page < 1 || pageSize < 1 || pageSize > 100)
         {
             return BadRequest("Page and pageSize must be greater than 0");
         }

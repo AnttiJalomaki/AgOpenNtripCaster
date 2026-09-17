@@ -40,6 +40,8 @@ public class MountPointsController : ControllerBase
         }
 
         var response = await _mountPointService.GetMountPointsAsync(page, pageSize);
+        foreach (var mountPoint in response.MountPoints)
+            RedactOwner(mountPoint);
         return Ok(response);
     }
 
@@ -87,7 +89,20 @@ public class MountPointsController : ControllerBase
             return NotFound("Mount point not found");
         }
 
+        RedactOwner(mountPoint);
         return Ok(mountPoint);
+    }
+
+    private void RedactOwner(MountPointDto mountPoint)
+    {
+        var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        if (User.IsInRole("Admin") || User.IsInRole("ReadOnly") ||
+            (userId != null && mountPoint.UserId == userId))
+            return;
+        mountPoint.UserId = null;
+        mountPoint.OwnerEmail = null;
+        mountPoint.OwnerFullName = null;
+        mountPoint.AllowedGroupNames.Clear();
     }
 
     /// <summary>

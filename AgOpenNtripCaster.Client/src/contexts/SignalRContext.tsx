@@ -15,13 +15,14 @@ const SignalRContext = createContext<SignalRContextType>({
 export const useSignalR = () => useContext(SignalRContext);
 
 export const SignalRProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, user } = useAuth();
+  const canViewTelemetry = user?.roles?.some(role => role === 'Admin' || role === 'ReadOnly') ?? false;
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
 
   useEffect(() => {
     // Only connect if user is authenticated
-    if (!isAuthenticated) {
+    if (!isAuthenticated || !canViewTelemetry) {
       // Disconnect if not authenticated
       signalRService.disconnect();
       setIsConnected(false);
@@ -60,7 +61,7 @@ export const SignalRProvider: React.FC<{ children: React.ReactNode }> = ({ child
       // Don't disconnect here - keep connection alive for app lifetime
       // Only disconnect when user logs out (handled by isAuthenticated change)
     };
-  }, [isAuthenticated]);
+  }, [isAuthenticated, canViewTelemetry]);
 
   return (
     <SignalRContext.Provider value={{ isConnected, isConnecting }}>

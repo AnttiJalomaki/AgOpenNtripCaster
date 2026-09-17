@@ -1,0 +1,6 @@
+# Optional public NTRIP listener; use together with docker-compose.private.yml.
+# Require authentication on every mountpoint. The web UI remains Tailscale-only.
+services:
+  backend:
+    ports:
+      - "${NTRIP_PUBLIC_IP:?Set NTRIP_PUBLIC_IP}:2101:2101"
