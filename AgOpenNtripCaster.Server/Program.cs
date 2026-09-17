@@ -2,6 +2,8 @@ using System.Text;
 using DotNetEnv;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.DataProtection;
+using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
@@ -45,9 +47,14 @@ if (string.IsNullOrEmpty(connectionString))
     var dbPort = Environment.GetEnvironmentVariable("DB_PORT") ?? "5432";
     var dbName = Environment.GetEnvironmentVariable("DB_NAME") ?? "ntripcaster";
     var dbUser = Environment.GetEnvironmentVariable("DB_USER") ?? "ntripuser";
-    var dbPassword = Environment.GetEnvironmentVariable("DB_PASSWORD") ?? "ntrippass";
+    var dbPassword = Environment.GetEnvironmentVariable("DB_PASSWORD")
+        ?? throw new InvalidOperationException("DB_PASSWORD or CONNECTION_STRING must be configured.");
 
-    connectionString = $"Host={dbHost};Port={dbPort};Database={dbName};Username={dbUser};Password={dbPassword}";
+    connectionString = new Npgsql.NpgsqlConnectionStringBuilder
+    {
+        Host = dbHost, Port = int.Parse(dbPort), Database = dbName,
+        Username = dbUser, Password = dbPassword
+    }.ConnectionString;
 }
 
 builder.Services.AddDbContext<ApplicationDbContext>(options =>
@@ -81,32 +88,23 @@ builder.Services.Configure<IdentityOptions>(options =>
     options.User.RequireUniqueEmail = true;
 });
 
-// Configure JWT Authentication
-var jwtSecret = Environment.GetEnvironmentVariable("JWT_SECRET") ?? "your-secret-key-here-min-32-chars";
-var jwtKey = Encoding.ASCII.GetBytes(jwtSecret);
-
-builder.Services.AddAuthentication(options =>
-{
-    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
-    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
-})
-.AddJwtBearer(options =>
-{
-    options.TokenValidationParameters = new TokenValidationParameters
-    {
-        ValidateIssuerSigningKey = true,
-        IssuerSigningKey = new SymmetricSecurityKey(jwtKey),
-        ValidateIssuer = false,
-        ValidateAudience = false,
-        ValidateLifetime = true,
-        ClockSkew = TimeSpan.Zero
-    };
-});
+builder.Services.AddCasterAuthentication(builder.Configuration);
 
 builder.Services.AddAuthorization();
+builder.Services.AddDataProtection().PersistKeysToFileSystem(
+    new DirectoryInfo(builder.Configuration["DATA_PROTECTION_PATH"] ?? "/app/data-protection-keys"));
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    // Bounded shared budget also works when the app is behind an untrusted proxy.
+    options.AddPolicy("authentication", _ => RateLimitPartition.GetFixedWindowLimiter(
+        "authentication", _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 30, Window = TimeSpan.FromMinutes(1), QueueLimit = 0
+        }));
+});
 
 // Configure Email Service
-builder.Configuration.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true);
 builder.Services.AddScoped<IEmailService, EmailService>();
 builder.Services.AddScoped<IEmailTriggerSettingsService, EmailTriggerSettingsService>();
 builder.Services.AddScoped<IEmailSmtpSettingsService, EmailSmtpSettingsService>();
@@ -239,10 +237,12 @@ app.UseHttpsRedirection();
 app.UseCors("FrontendPolicy");
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 
 // Map controllers and SignalR hub
 app.MapControllers();
-app.MapHub<AgOpenNtripCaster.Server.Hubs.NtripHub>("/api/ntrip-hub");
+app.MapHub<AgOpenNtripCaster.Server.Hubs.NtripHub>("/api/ntrip-hub", options =>
+    options.CloseOnAuthenticationExpiration = true);
 
 // Health check endpoint (for Docker health checks)
 app.MapGet("/api/health", () => new
@@ -250,7 +250,7 @@ app.MapGet("/api/health", () => new
     status = "healthy",
     timestamp = DateTime.UtcNow,
     version = "1.0.0"
-}).WithName("Health").WithOpenApi();
+}).WithName("Health");
 
 // Database initialization & seed default admin user
 using (var scope = app.Services.CreateScope())

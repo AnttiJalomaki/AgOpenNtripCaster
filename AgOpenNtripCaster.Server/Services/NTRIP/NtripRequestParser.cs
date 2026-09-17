@@ -8,14 +8,19 @@ public static partial class NtripRequestParser
     public static async Task<NtripRequest> ReadAsync(
         Stream stream,
         CancellationToken cancellationToken,
-        int maxHeaderBytes = NtripProtocol.MaxHeaderBytes)
+        int maxHeaderBytes = NtripProtocol.MaxHeaderBytes,
+        TimeSpan? headerTimeout = null)
     {
+        // A total deadline prevents a slow sender from holding a socket indefinitely.
+        // This token is deliberately not used for the subsequent correction stream.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(headerTimeout ?? TimeSpan.FromSeconds(10));
         var bytes = new List<byte>(512);
         var buffer = new byte[1];
 
         while (bytes.Count < maxHeaderBytes)
         {
-            var read = await stream.ReadAsync(buffer, cancellationToken);
+            var read = await stream.ReadAsync(buffer, deadline.Token);
             if (read == 0)
                 break;
 
@@ -31,7 +36,7 @@ public static partial class NtripRequestParser
         if (bytes.Count == 0)
             throw new InvalidDataException("Empty NTRIP request");
 
-        return Parse(Encoding.ASCII.GetString(bytes.ToArray()));
+        throw new InvalidDataException("Incomplete NTRIP request header");
     }
 
     public static NtripRequest Parse(string headerText)

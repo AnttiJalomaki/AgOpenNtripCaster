@@ -1,12 +1,12 @@
 # AgOpen Ntripcaster Web Image
 # Builds the React frontend and serves it from nginx.
 
-FROM node:20-alpine AS build
+FROM node:24-alpine AS build
 
 WORKDIR /app
 
 COPY AgOpenNtripCaster.Client/package*.json ./
-RUN npm install --legacy-peer-deps
+RUN npm ci --legacy-peer-deps
 
 COPY AgOpenNtripCaster.Client ./
 RUN npm run build

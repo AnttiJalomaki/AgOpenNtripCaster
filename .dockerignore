@@ -1,0 +1,15 @@
+.git
+**/bin
+**/obj
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+**/private
+**/logs
+**/backups
+**/*.dump
+**/*.sql
+**/*.tar*
+**/*.pem
+**/*.key

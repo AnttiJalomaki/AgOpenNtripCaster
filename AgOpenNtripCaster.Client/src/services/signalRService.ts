@@ -139,13 +139,14 @@ class SignalRService {
 
       // Build hub URL - use base server URL (without /api since the hub path includes it)
       const serverUrl = import.meta.env.VITE_API_URL ?
-        import.meta.env.VITE_API_URL.replace('/api', '') :
-        'http://localhost:5000';
+        import.meta.env.VITE_API_URL.replace(/\/api\/?$/, '') :
+        '';
       const hubUrl = `${serverUrl}/api/ntrip-hub`;
 
       this.connection = new signalR.HubConnectionBuilder()
         .withUrl(hubUrl, {
           withCredentials: true,
+          accessTokenFactory: () => localStorage.getItem('accessToken') || '',
         })
         .withAutomaticReconnect({
           nextRetryDelayInMilliseconds: (retryContext) => {

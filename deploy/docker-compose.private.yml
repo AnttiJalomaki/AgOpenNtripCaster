@@ -1,0 +1,81 @@
+# Private caster: publish only on the Tailscale address, never 0.0.0.0.
+name: ntripcaster
+x-logging: &logging
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "3"
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ntripcaster-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-ntripcaster_db}
+      POSTGRES_USER: ${DB_USER:-ntripcaster}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    pids_limit: 128
+    logging: *logging
+    restart: unless-stopped
+  backend:
+    image: ${DOCKER_IMAGE_REPO:-docker.io/nevaberry/agopen-ntripcaster}:backend-${APP_TAG:?Set APP_TAG}
+    container_name: ntripcaster-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      DB_HOST: postgres
+      DB_NAME: ${DB_NAME:-ntripcaster_db}
+      DB_USER: ${DB_USER:-ntripcaster}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+      Admin__Email: ${ADMIN_EMAIL:?Set ADMIN_EMAIL}
+      Admin__Password: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD}
+      CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS}
+      REGISTRATION_ENABLED: "false"
+      SMTP_ENABLED: "false"
+      NTRIP_PORT: "2101"
+    ports:
+      - "${TAILSCALE_IP:?Set TAILSCALE_IP}:2101:2101"
+    volumes:
+      - ./logs:/app/logs:Z
+      - ./backups:/backups:Z
+      - ./data-protection-keys:/app/data-protection-keys:Z
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 384m
+    pids_limit: 256
+    logging: *logging
+    restart: unless-stopped
+  nginx:
+    image: ${DOCKER_IMAGE_REPO:-docker.io/nevaberry/agopen-ntripcaster}:web-${APP_TAG:?Set APP_TAG}
+    container_name: ntripcaster-nginx
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${TAILSCALE_IP:?Set TAILSCALE_IP}:80:80"
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=16m
+      - /var/run:size=1m
+      - /tmp:size=8m,mode=1777
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    pids_limit: 64
+    logging: *logging
+    restart: unless-stopped
+volumes:
+  postgres_data:

@@ -12,7 +12,7 @@ services:
     environment:
       POSTGRES_DB: ${DB_NAME:-ntripcaster_db}
       POSTGRES_USER: ${DB_USER:-ntripcaster}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -42,12 +42,13 @@ services:
       DB_PORT: ${DB_PORT:-5432}
       DB_NAME: ${DB_NAME:-ntripcaster_db}
       DB_USER: ${DB_USER:-ntripcaster}
-      DB_PASSWORD: ${DB_PASSWORD:-password}
-      JWT_SECRET: ${JWT_SECRET}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+      REGISTRATION_ENABLED: ${REGISTRATION_ENABLED:-false}
       JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-24}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
       Admin__Email: ${ADMIN_EMAIL:-admin@ntripcaster.local}
-      Admin__Password: ${ADMIN_PASSWORD:-ChangeMe@12345}
+      Admin__Password: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD}
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USERNAME: ${SMTP_USERNAME}
@@ -59,8 +60,9 @@ services:
       NTRIP_PORT: ${NTRIP_PORT:-2101}
       SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
     volumes:
-      - ./logs:/app/logs
-      - ./backups:/backups
+      - ./logs:/app/logs:Z
+      - ./backups:/backups:Z
+      - ./data-protection-keys:/app/data-protection-keys:Z
     ports:
       - "${NTRIP_PORT:-2101}:2101"
     networks:

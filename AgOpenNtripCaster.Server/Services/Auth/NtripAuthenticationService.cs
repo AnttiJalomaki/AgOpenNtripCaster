@@ -182,8 +182,10 @@ public class NtripAuthenticationService
             if (allowedGroupIds.Count > 0)
             {
                 // Mount point is restricted to specific groups
-                var userGroups = user.Groups.Select(g => g.Id).ToHashSet();
-                var hasAccess = userGroups.Intersect(allowedGroupIds).Any();
+                var hasAccess = await _dbContext.Users
+                    .Where(u => u.Id == user.Id)
+                    .SelectMany(u => u.Groups)
+                    .AnyAsync(g => allowedGroupIds.Contains(g.Id));
 
                 if (!hasAccess)
                 {

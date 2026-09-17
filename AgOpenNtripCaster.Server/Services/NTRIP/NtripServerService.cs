@@ -44,6 +44,7 @@ public class NtripServerService : IHostedService
     private Timer? _healthCheckTimer;
 
     private readonly int _ntripPort;
+    private readonly ConnectionAdmission _admission;
     private const int ListenBacklog = 128;
     private const int StatsUpdateIntervalMs = 10000; // Update stats every 10 seconds
     private const int HealthCheckIntervalMs = 10000; // Check client health every 10 seconds
@@ -72,6 +73,9 @@ public class NtripServerService : IHostedService
 
         // Read NTRIP port from configuration, default to 2101
         _ntripPort = configuration.GetValue<int>("NTRIP_PORT", 2101);
+        _admission = new ConnectionAdmission(
+            Math.Clamp(configuration.GetValue<int>("NTRIP_MAX_CONNECTIONS", 256), 1, 10000),
+            Math.Clamp(configuration.GetValue<int>("NTRIP_MAX_CONNECTIONS_PER_IP", 32), 1, 1000));
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -243,6 +247,13 @@ public class NtripServerService : IHostedService
             try
             {
                 var tcpClient = await _tcpListener!.AcceptTcpClientAsync(cancellationToken);
+                var address = ((IPEndPoint)tcpClient.Client.RemoteEndPoint!).Address.ToString();
+                var lease = _admission.TryAcquire(address);
+                if (lease is null)
+                {
+                    tcpClient.Dispose();
+                    continue;
+                }
 
                 // Disable Nagle's algorithm for low-latency real-time RTCM data
                 tcpClient.NoDelay = true;
@@ -250,7 +261,7 @@ public class NtripServerService : IHostedService
                 var clientId = Guid.NewGuid().ToString();
 
                 // Handle connection in background
-                _ = HandleConnectionAsync(clientId, tcpClient, cancellationToken);
+                _ = HandleAdmittedConnectionAsync(clientId, tcpClient, lease, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -267,6 +278,12 @@ public class NtripServerService : IHostedService
     /// <summary>
     /// Handle incoming connection (source or client)
     /// </summary>
+    private async Task HandleAdmittedConnectionAsync(string clientId, TcpClient tcpClient, IDisposable lease, CancellationToken cancellationToken)
+    {
+        using (lease)
+            await HandleConnectionAsync(clientId, tcpClient, cancellationToken);
+    }
+
     private async Task HandleConnectionAsync(string clientId, TcpClient tcpClient, CancellationToken cancellationToken)
     {
         try

@@ -51,6 +51,8 @@ public class AuthService : IAuthService
 
     public async Task<RegisterResponse> RegisterAsync(RegisterRequest request, string baseUrl)
     {
+        if (!_configuration.GetValue<bool>("REGISTRATION_ENABLED"))
+            return new RegisterResponse { Success = false, Message = "Registration is disabled. Contact the caster administrator." };
         // Validate input
         if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Password))
         {
@@ -427,8 +429,7 @@ public class AuthService : IAuthService
     private async Task<string> GenerateAccessTokenAsync(NtripUser user)
     {
         // Use same secret as in Program.cs for JWT validation
-        var jwtSecret = Environment.GetEnvironmentVariable("JWT_SECRET") ?? "your-secret-key-here-min-32-chars";
-        var key = new SymmetricSecurityKey(Encoding.ASCII.GetBytes(jwtSecret));
+        var key = JwtSettings.SigningKey(_configuration);
         var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
         var claims = new List<Claim>
@@ -455,8 +456,8 @@ public class AuthService : IAuthService
         }
 
         var token = new JwtSecurityToken(
-            issuer: _configuration["Jwt:Issuer"],
-            audience: _configuration["Jwt:Audience"],
+            issuer: JwtSettings.Issuer(_configuration),
+            audience: JwtSettings.Audience(_configuration),
             claims: claims,
             expires: DateTime.UtcNow.AddHours(1),
             signingCredentials: creds);
