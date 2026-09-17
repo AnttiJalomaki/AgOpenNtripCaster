@@ -2,7 +2,7 @@
 # This Dockerfile only builds the frontend application
 # Static files are served by a separate NGINX container
 
-FROM node:20-alpine AS build
+FROM node:24-alpine AS build
 
 WORKDIR /app
 
@@ -10,7 +10,7 @@ WORKDIR /app
 COPY AgOpenNtripCaster.Client/package*.json ./
 
 # Install dependencies
-RUN npm install --legacy-peer-deps
+RUN npm ci --legacy-peer-deps
 
 # Copy source code
 COPY AgOpenNtripCaster.Client ./
