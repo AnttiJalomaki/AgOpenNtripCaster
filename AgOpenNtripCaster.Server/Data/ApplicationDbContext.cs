@@ -24,6 +24,7 @@ public class ApplicationDbContext : IdentityDbContext<NtripUser>
     public DbSet<EmailSmtpSettings> EmailSmtpSettings { get; set; } = null!;
     public DbSet<TelegramSettings> TelegramSettings { get; set; } = null!;
     public DbSet<PerformanceMetric> PerformanceMetrics { get; set; } = null!;
+    public DbSet<DiagnosticEvent> DiagnosticEvents { get; set; } = null!;
 
     protected override void OnModelCreating(ModelBuilder builder)
     {
@@ -70,12 +71,21 @@ public class ApplicationDbContext : IdentityDbContext<NtripUser>
             .HasForeignKey(c => c.UserId)
             .OnDelete(DeleteBehavior.SetNull);
 
+        builder.Entity<ClientSession>()
+            .HasIndex(c => c.ConnectedAt);
+
+        builder.Entity<ClientSession>()
+            .HasIndex(c => new { c.UserId, c.ConnectedAt });
+
         // Configure SourceConnection
         builder.Entity<SourceConnection>()
             .HasOne(s => s.MountPoint)
             .WithMany(m => m.SourceConnections)
             .HasForeignKey(s => s.MountPointId)
             .OnDelete(DeleteBehavior.Cascade);
+
+        builder.Entity<SourceConnection>()
+            .HasIndex(s => s.ConnectedAt);
 
         // Configure Activity
         builder.Entity<Activity>()
@@ -89,5 +99,45 @@ public class ApplicationDbContext : IdentityDbContext<NtripUser>
             .WithMany()
             .HasForeignKey(a => a.UserId)
             .OnDelete(DeleteBehavior.SetNull);
+
+        // Configure DiagnosticEvent
+        builder.Entity<DiagnosticEvent>()
+            .HasOne(e => e.User)
+            .WithMany()
+            .HasForeignKey(e => e.UserId)
+            .OnDelete(DeleteBehavior.SetNull);
+
+        builder.Entity<DiagnosticEvent>()
+            .HasOne(e => e.ClientSession)
+            .WithMany()
+            .HasForeignKey(e => e.ClientSessionId)
+            .OnDelete(DeleteBehavior.SetNull);
+
+        builder.Entity<DiagnosticEvent>()
+            .HasOne(e => e.SourceConnection)
+            .WithMany()
+            .HasForeignKey(e => e.SourceConnectionId)
+            .OnDelete(DeleteBehavior.SetNull);
+
+        builder.Entity<DiagnosticEvent>()
+            .HasOne(e => e.MountPoint)
+            .WithMany()
+            .HasForeignKey(e => e.MountPointId)
+            .OnDelete(DeleteBehavior.SetNull);
+
+        builder.Entity<DiagnosticEvent>()
+            .HasIndex(e => e.Timestamp);
+
+        builder.Entity<DiagnosticEvent>()
+            .HasIndex(e => e.Kind);
+
+        builder.Entity<DiagnosticEvent>()
+            .HasIndex(e => e.UserId);
+
+        builder.Entity<DiagnosticEvent>()
+            .HasIndex(e => e.ClientSessionId);
+
+        builder.Entity<DiagnosticEvent>()
+            .HasIndex(e => e.MountPointId);
     }
 }

@@ -29,6 +29,8 @@ import { PerformancePage } from './pages/admin/PerformancePage';
 import { SystemLogsPage } from './pages/admin/SystemLogsPage';
 import { DatabaseManagementPage } from './pages/admin/DatabaseManagementPage';
 import { NotificationSettingsPage } from './pages/admin/NotificationSettingsPage';
+import { DiagnosticsPage } from './pages/admin/DiagnosticsPage';
+import { DiagnosticSessionPage } from './pages/admin/DiagnosticSessionPage';
 import './styles/globals.css';
 import './App.css';
 
@@ -179,6 +181,24 @@ function App() {
             element={
               <ProtectedRoute requiredRoles={['Admin', 'ReadOnly']}>
                 <AnalyticsPage />
+              </ProtectedRoute>
+            }
+          />
+
+          <Route
+            path="/admin/diagnostics"
+            element={
+              <ProtectedRoute requiredRoles={['Admin', 'ReadOnly']}>
+                <DiagnosticsPage />
+              </ProtectedRoute>
+            }
+          />
+
+          <Route
+            path="/admin/diagnostics/sessions/:sessionId"
+            element={
+              <ProtectedRoute requiredRoles={['Admin', 'ReadOnly']}>
+                <DiagnosticSessionPage />
               </ProtectedRoute>
             }
           />

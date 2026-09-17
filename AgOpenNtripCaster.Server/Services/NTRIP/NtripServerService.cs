@@ -1,6 +1,8 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using AgOpenNtripCaster.Server.Data;
@@ -8,6 +10,7 @@ using AgOpenNtripCaster.Server.Hubs;
 using AgOpenNtripCaster.Server.Models.DTOs;
 using AgOpenNtripCaster.Server.Models.Entities;
 using AgOpenNtripCaster.Server.Services.Auth;
+using AgOpenNtripCaster.Server.Services.Diagnostics;
 using AgOpenNtripCaster.Server.Services.Notifications;
 using AgOpenNtripCaster.Server.Services.Email;
 
@@ -29,6 +32,9 @@ public class NtripServerService : IHostedService
     private readonly IConfiguration _configuration;
     private readonly ITelegramNotificationService _telegramService;
     private readonly Dictionary<string, string> _clientSessionIds; // clientId -> sessionId mapping
+    private readonly ConcurrentDictionary<string, RoverDiagnosticCounters> _roverCounters; // clientId -> diagnostic counters
+    private readonly ConcurrentDictionary<string, int> _sourceConnectionIds; // sourceId -> source connection id
+    private readonly ConcurrentDictionary<string, SourceDiagnosticCounters> _sourceCounters; // sourceId -> diagnostic counters
     private readonly Dictionary<string, int> _mountPointClientCounts; // mountPointName -> client count
 
     private TcpListener? _tcpListener;
@@ -59,6 +65,9 @@ public class NtripServerService : IHostedService
         _configuration = configuration;
         _telegramService = telegramService;
         _clientSessionIds = new Dictionary<string, string>();
+        _roverCounters = new ConcurrentDictionary<string, RoverDiagnosticCounters>();
+        _sourceConnectionIds = new ConcurrentDictionary<string, int>();
+        _sourceCounters = new ConcurrentDictionary<string, SourceDiagnosticCounters>();
         _mountPointClientCounts = new Dictionary<string, int>();
 
         // Read NTRIP port from configuration, default to 2101
@@ -313,6 +322,50 @@ public class NtripServerService : IHostedService
         }
     }
 
+    private static string? GetHeader(NtripRequest request, string name)
+    {
+        return request.Headers.TryGetValue(name, out var value) ? value : null;
+    }
+
+    private static string BuildJson(Dictionary<string, object?> values)
+    {
+        return JsonSerializer.Serialize(values.Where(kvp => kvp.Value != null).ToDictionary(kvp => kvp.Key, kvp => kvp.Value));
+    }
+
+    private async Task RecordDiagnosticEventAsync(
+        string kind,
+        string severity,
+        string message,
+        string? userId = null,
+        string? clientSessionId = null,
+        int? sourceConnectionId = null,
+        int? mountPointId = null,
+        string? dataJson = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var scope = _serviceProvider.CreateScope();
+            var diagnostics = scope.ServiceProvider.GetRequiredService<IDiagnosticEventService>();
+
+            await diagnostics.RecordAsync(new CreateDiagnosticEventRequest
+            {
+                Kind = kind,
+                Severity = severity,
+                UserId = userId,
+                ClientSessionId = clientSessionId,
+                SourceConnectionId = sourceConnectionId,
+                MountPointId = mountPointId,
+                Message = message,
+                DataJson = dataJson
+            }, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to record diagnostic event {Kind}", kind);
+        }
+    }
+
     /// <summary>
     /// Handle GNSS source connection
     /// SOURCE password mountpoint
@@ -359,6 +412,12 @@ public class NtripServerService : IHostedService
             // Register source
             if (!_connectionPool.RegisterSource(sourceId, mountPointName, tcpClient))
             {
+                await RecordDiagnosticEventAsync(
+                    "DuplicateSourceRejected",
+                    "warning",
+                    $"Duplicate base station source rejected for mountpoint '{mountPointName}'",
+                    mountPointId: mountPoint.Id,
+                    cancellationToken: cancellationToken);
                 await SendSourceErrorAsync(stream, request, "503 Service Unavailable", cancellationToken);
                 return;
             }
@@ -368,6 +427,11 @@ public class NtripServerService : IHostedService
 
             // Create SourceConnection in database
             var sourceConnectionId = await CreateSourceConnectionAsync(mountPointName, cancellationToken);
+            if (sourceConnectionId.HasValue)
+            {
+                _sourceConnectionIds[sourceId] = sourceConnectionId.Value;
+                _sourceCounters[sourceId] = new SourceDiagnosticCounters();
+            }
 
             // Send Telegram notification for source connected
             await _telegramService.SendSourceConnectedAsync(mountPointName, cancellationToken);
@@ -399,7 +463,9 @@ public class NtripServerService : IHostedService
             // Note: SourceConnectionId is not stored, so we mark the latest one for this mountpoint
             if (!string.IsNullOrEmpty(mountPointName))
             {
-                await MarkSourceConnectionDisconnectedAsync(mountPointName, cancellationToken);
+                await MarkSourceConnectionDisconnectedAsync(mountPointName, cancellationToken, sourceId, "Connection closed");
+                _sourceConnectionIds.TryRemove(sourceId, out _);
+                _sourceCounters.TryRemove(sourceId, out _);
 
                 // Send Telegram notification for source disconnected
                 await _telegramService.SendSourceDisconnectedAsync(mountPointName, cancellationToken);
@@ -476,11 +542,40 @@ public class NtripServerService : IHostedService
 
             // Create ClientSession in database
             var clientIpAddress = (tcpClient.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString();
-            var sessionId = await CreateClientSessionAsync(username, clientId, mountPointName, clientIpAddress, cancellationToken);
+            var clientUserAgent = GetHeader(request, "User-Agent");
+            var sessionId = await CreateClientSessionAsync(username, clientId, mountPointName, clientIpAddress, clientUserAgent, cancellationToken);
 
             if (!string.IsNullOrEmpty(sessionId))
             {
                 _clientSessionIds[clientId] = sessionId;
+                _roverCounters[clientId] = new RoverDiagnosticCounters();
+
+                await RecordDiagnosticEventAsync(
+                    "RoverConnected",
+                    "info",
+                    $"Rover '{username}' connected to '{mountPointName}'",
+                    userId: authResult.User?.Id,
+                    clientSessionId: sessionId,
+                    mountPointId: authResult.MountPoint?.Id,
+                    dataJson: BuildJson(new Dictionary<string, object?>
+                    {
+                        ["clientId"] = clientId,
+                        ["ipAddress"] = clientIpAddress,
+                        ["userAgent"] = clientUserAgent
+                    }),
+                    cancellationToken: cancellationToken);
+
+                if (_connectionPool.GetSourceForMountPoint(mountPointName) == null)
+                {
+                    await RecordDiagnosticEventAsync(
+                        "NoSourceForRover",
+                        "warning",
+                        $"Rover '{username}' connected but no active base source exists for '{mountPointName}'",
+                        userId: authResult.User?.Id,
+                        clientSessionId: sessionId,
+                        mountPointId: authResult.MountPoint?.Id,
+                        cancellationToken: cancellationToken);
+                }
             }
 
             // Increment client count for this mount point
@@ -515,8 +610,9 @@ public class NtripServerService : IHostedService
             // Mark session as disconnected
             if (_clientSessionIds.TryGetValue(clientId, out var sessionId))
             {
-                await MarkClientSessionDisconnectedAsync(sessionId, cancellationToken, clientId);
+                await MarkClientSessionDisconnectedAsync(sessionId, cancellationToken, clientId, "Connection closed");
                 _clientSessionIds.Remove(clientId);
+                _roverCounters.TryRemove(clientId, out _);
             }
 
             _connectionPool.UnregisterClient(clientId);
@@ -650,6 +746,12 @@ public class NtripServerService : IHostedService
             sourceConnection.BytesReceived += payload.Length;
             sourceConnection.LastActivityAt = DateTime.UtcNow;
         }
+
+        if (_sourceCounters.TryGetValue(sourceId, out var sourceCounters))
+        {
+            sourceCounters.RecordRtcmReceived(payload.Length, DateTime.UtcNow);
+            sourceCounters.RecordBytesBroadcastToRovers((long)payload.Length * clients.Count);
+        }
     }
 
     /// <summary>
@@ -767,6 +869,8 @@ public class NtripServerService : IHostedService
     {
         var lastPositionTime = DateTime.MinValue;  // Position is optional
         var hasReceivedPosition = false;  // Track if we've received any position
+        var firstGgaDiagnosticRecorded = false;
+        var invalidGgaDiagnosticRecorded = false;
         const int MaxPositionAgeSec = 15;
 
         _logger.LogInformation("Client {ClientId} starting zero-copy stream for {MountPoint}", clientId, mountPointName);
@@ -798,93 +902,90 @@ public class NtripServerService : IHostedService
                 {
                     lineCount++;
 
-                    // Parse NMEA GPGGA sentences: $GPGGA,time,lat,N/S,lon,E/W,...
-                    if (line.StartsWith("$GPGGA"))
+                    if (GgaFrameParser.TryParse(line, out var ggaFrame))
                     {
-                        var parts = line.Split(',');
-                        if (parts.Length >= 6)
+                        var now = DateTime.UtcNow;
+                        var lineBytes = Encoding.ASCII.GetByteCount(line) + 1;
+
+                        if (_roverCounters.TryGetValue(cId, out var counters))
                         {
-                            // Parse latitude (DDMM.MMMM format)
-                            // IMPORTANT: Use InvariantCulture so "5242.000" is parsed as 5242.0, not 5242000
-                            if (double.TryParse(parts[2], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var latValue) &&
-                                (parts[3] == "N" || parts[3] == "S"))
+                            counters.RecordBytesReceived(lineBytes);
+                            counters.RecordGga(ggaFrame!, now);
+                        }
+
+                        if (ggaFrame!.IsPositionValid && ggaFrame.Latitude.HasValue && ggaFrame.Longitude.HasValue)
+                        {
+                            lastPositionTime = now;
+                            if (!hasReceivedPosition)
                             {
-                                // Parse longitude (DDDMM.MMMM format)
-                                if (double.TryParse(parts[4], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var lonValue) &&
-                                    (parts[5] == "E" || parts[5] == "W"))
+                                hasReceivedPosition = true;
+                                _logger.LogInformation("Client {ClientId} first position received: {Lat},{Lon}", cId, ggaFrame.Latitude, ggaFrame.Longitude);
+                            }
+
+                            var clientInfo = _connectionPool.GetClient(cId);
+                            if (clientInfo != null)
+                            {
+                                var accuracy = ggaFrame.Hdop ?? 5.0;
+                                clientInfo.LastLatitude = ggaFrame.Latitude.Value;
+                                clientInfo.LastLongitude = ggaFrame.Longitude.Value;
+                                clientInfo.LastAccuracy = accuracy;
+                                clientInfo.LastPositionAt = lastPositionTime;
+
+                                if (_clientSessionIds.TryGetValue(cId, out var sessionId))
                                 {
-                                    // Convert DDMM.MMMM to decimal degrees
-                                    // Latitude conversion
-                                    int latDegrees = (int)(latValue / 100.0);
-                                    double latMinutes = latValue - (latDegrees * 100.0);
-                                    double decimalLat = latDegrees + (latMinutes / 60.0);
-                                    if (parts[3] == "S") decimalLat = -decimalLat;
+                                    await UpdateClientSessionPositionAsync(sessionId, ggaFrame.Latitude.Value, ggaFrame.Longitude.Value, accuracy, ct);
 
-                                    // Longitude conversion
-                                    int lonDegrees = (int)(lonValue / 100.0);
-                                    double lonMinutes = lonValue - (lonDegrees * 100.0);
-                                    double decimalLon = lonDegrees + (lonMinutes / 60.0);
-                                    if (parts[5] == "W") decimalLon = -decimalLon;
-
-                                    var acc = 5.0; // Default accuracy for GPGGA
-
-                                    // Process position update
+                                    if (!firstGgaDiagnosticRecorded)
                                     {
-
-                                        lastPositionTime = DateTime.UtcNow;
-                                        if (!hasReceivedPosition)
-                                        {
-                                            hasReceivedPosition = true;
-                                            _logger.LogInformation("Client {ClientId} first position received: {Lat},{Lon}", cId, decimalLat, decimalLon);
-                                        }
-
-                                        var clientInfo = _connectionPool.GetClient(cId);
-                                        if (clientInfo != null)
-                                        {
-                                            clientInfo.LastLatitude = decimalLat;
-                                            clientInfo.LastLongitude = decimalLon;
-                                            clientInfo.LastAccuracy = acc;
-                                            clientInfo.LastPositionAt = lastPositionTime;
-
-                                            // Update ClientSession and broadcast via SignalR
-                                            if (_clientSessionIds.TryGetValue(cId, out var sessionId))
+                                        firstGgaDiagnosticRecorded = true;
+                                        await RecordDiagnosticEventAsync(
+                                            "FirstGgaReceived",
+                                            "info",
+                                            $"First valid GGA received from rover '{clientInfo.Username}'",
+                                            userId: null,
+                                            clientSessionId: sessionId,
+                                            mountPointId: null,
+                                            dataJson: BuildJson(new Dictionary<string, object?>
                                             {
-                                                await UpdateClientSessionPositionAsync(sessionId, decimalLat, decimalLon, acc, ct);
-                                            }
-
-                                            // Broadcast position update via SignalR
-                                            var positionUpdate = new ClientPositionUpdate
-                                            {
-                                                ClientId = cId,
-                                                Username = clientInfo.Username,
-                                                MountPoint = clientInfo.MountPointName,
-                                                Latitude = decimalLat,
-                                                Longitude = decimalLon,
-                                                Accuracy = acc,
-                                                Timestamp = lastPositionTime
-                                            };
-
-                                            await _hubContext.Clients.All.SendAsync("ClientPositionUpdated", positionUpdate, ct);
-                                        }
-                                        else
-                                        {
-                                            _logger.LogDebug("ClientInfo not found in pool for {ClientId}", cId);
-                                        }
+                                                ["fixQuality"] = ggaFrame.FixQuality,
+                                                ["satellites"] = ggaFrame.SatelliteCount,
+                                                ["hdop"] = ggaFrame.Hdop,
+                                                ["latitude"] = ggaFrame.Latitude,
+                                                ["longitude"] = ggaFrame.Longitude
+                                            }),
+                                            cancellationToken: ct);
                                     }
                                 }
-                                else
+
+                                var positionUpdate = new ClientPositionUpdate
                                 {
-                                    _logger.LogDebug("Failed to parse GPGGA longitude: {Lon} {Dir}", parts[4], parts[5]);
-                                }
-                            }
-                            else
-                            {
-                                _logger.LogDebug("Failed to parse GPGGA latitude: {Lat} {Dir}", parts[2], parts[3]);
+                                    ClientId = cId,
+                                    Username = clientInfo.Username,
+                                    MountPoint = clientInfo.MountPointName,
+                                    Latitude = ggaFrame.Latitude.Value,
+                                    Longitude = ggaFrame.Longitude.Value,
+                                    Accuracy = accuracy,
+                                    Timestamp = lastPositionTime
+                                };
+
+                                await _hubContext.Clients.All.SendAsync("ClientPositionUpdated", positionUpdate, ct);
                             }
                         }
-                        else
+                        else if (!invalidGgaDiagnosticRecorded && _clientSessionIds.TryGetValue(cId, out var sessionId))
                         {
-                            _logger.LogDebug("Invalid GPGGA format ({PartCount} parts): {Line}", parts.Length, line.Substring(0, Math.Min(50, line.Length)));
+                            invalidGgaDiagnosticRecorded = true;
+                            await RecordDiagnosticEventAsync(
+                                "InvalidGga",
+                                "warning",
+                                "Rover sent GGA without a valid RTK position",
+                                clientSessionId: sessionId,
+                                dataJson: BuildJson(new Dictionary<string, object?>
+                                {
+                                    ["fixQuality"] = ggaFrame.FixQuality,
+                                    ["satellites"] = ggaFrame.SatelliteCount,
+                                    ["hdop"] = ggaFrame.Hdop
+                                }),
+                                cancellationToken: ct);
                         }
                     }
                 }
@@ -924,6 +1025,21 @@ public class NtripServerService : IHostedService
                             {
                                 client.IsStreaming = false;
                                 _logger.LogWarning("Client {ClientId} stream paused (stale position)", clientId);
+
+                                if (_roverCounters.TryGetValue(clientId, out var counters) && counters.MarkPaused(DateTime.UtcNow) &&
+                                    _clientSessionIds.TryGetValue(clientId, out var sessionId))
+                                {
+                                    await RecordDiagnosticEventAsync(
+                                        "StreamPaused",
+                                        "warning",
+                                        $"Rover '{client.Username}' stream paused because GGA is stale",
+                                        clientSessionId: sessionId,
+                                        dataJson: BuildJson(new Dictionary<string, object?>
+                                        {
+                                            ["positionAgeSeconds"] = timeSinceLastPos.TotalSeconds
+                                        }),
+                                        cancellationToken: cancellationToken);
+                                }
                             }
 
                             await Task.Delay(1000, cancellationToken);
@@ -936,6 +1052,17 @@ public class NtripServerService : IHostedService
                     {
                         client.IsStreaming = true;
                         _logger.LogInformation("Client {ClientId} stream active", clientId);
+
+                        if (_roverCounters.TryGetValue(clientId, out var counters) && counters.MarkResumed(DateTime.UtcNow) &&
+                            _clientSessionIds.TryGetValue(clientId, out var sessionId))
+                        {
+                            await RecordDiagnosticEventAsync(
+                                "StreamResumed",
+                                "info",
+                                $"Rover '{client.Username}' stream resumed after fresh GGA",
+                                clientSessionId: sessionId,
+                                cancellationToken: cancellationToken);
+                        }
                     }
 
                     // Read SharedRtcmBuffer from channel (waits if no data available)
@@ -965,6 +1092,11 @@ public class NtripServerService : IHostedService
                                     // Update statistics
                                     client.BytesSent += sharedBuffer.Length;
                                     client.LastActivityAt = DateTime.UtcNow;
+                                    if (_roverCounters.TryGetValue(clientId, out var counters))
+                                    {
+                                        counters.RecordBytesSent(sharedBuffer.Length);
+                                        counters.RecordPendingBufferCount(Math.Max(client.PendingBufferCount, 0));
+                                    }
 
                                     _logger.LogDebug("Client {ClientId} sent {Bytes} bytes (zero-copy)", clientId, sharedBuffer.Length);
                                 }
@@ -972,6 +1104,19 @@ public class NtripServerService : IHostedService
                                 {
                                     _logger.LogInformation("Client {ClientId} disconnected during stream: {Message}",
                                         clientId, socketEx.Message);
+                                    if (_clientSessionIds.TryGetValue(clientId, out var sessionId))
+                                    {
+                                        await RecordDiagnosticEventAsync(
+                                            "WriteFailed",
+                                            "warning",
+                                            $"Rover '{client.Username}' disconnected during RTCM write",
+                                            clientSessionId: sessionId,
+                                            dataJson: BuildJson(new Dictionary<string, object?>
+                                            {
+                                                ["socketError"] = socketEx.Message
+                                            }),
+                                            cancellationToken: cancellationToken);
+                                    }
                                     break;
                                 }
                                 finally
@@ -1212,6 +1357,7 @@ public class NtripServerService : IHostedService
         string clientId,
         string mountPointName,
         string? clientIpAddress,
+        string? clientUserAgent,
         CancellationToken cancellationToken)
     {
         try
@@ -1266,6 +1412,7 @@ public class NtripServerService : IHostedService
                         UserId = user.Id,
                         MountPointId = mountPoint.Id,
                         ClientIpAddress = clientIpAddress,
+                        ClientUserAgent = clientUserAgent,
                         SerialNumber = serialNumber,
                         ConnectedAt = DateTime.UtcNow,
                         Status = ClientStreamStatus.Connected
@@ -1345,7 +1492,8 @@ public class NtripServerService : IHostedService
     private async Task MarkClientSessionDisconnectedAsync(
         string sessionId,
         CancellationToken cancellationToken,
-        string? clientId = null)
+        string? clientId = null,
+        string? disconnectReason = null)
     {
         try
         {
@@ -1363,6 +1511,29 @@ public class NtripServerService : IHostedService
 
                 session.DisconnectedAt = DateTime.UtcNow;
                 session.Status = ClientStreamStatus.Disconnected;
+                session.DisconnectReason = disconnectReason;
+
+                if (!string.IsNullOrEmpty(clientId) && _roverCounters.TryGetValue(clientId, out var counters))
+                {
+                    session.BytesSent = counters.BytesSent;
+                    session.BytesReceived = counters.BytesReceived;
+                    session.FirstGgaAt = counters.FirstGgaAt;
+                    session.GgaFrameCount = counters.GgaFrameCount;
+                    session.InvalidGgaFrameCount = counters.InvalidGgaFrameCount;
+                    session.LastLatitude = counters.LastValidLatitude ?? session.LastLatitude;
+                    session.LastLongitude = counters.LastValidLongitude ?? session.LastLongitude;
+                    session.LastAccuracy = counters.LastAccuracy ?? session.LastAccuracy;
+                    session.LastFixQuality = counters.LastFixQuality;
+                    session.LastSatelliteCount = counters.LastSatelliteCount;
+                    session.LastHdop = counters.LastHdop;
+                    session.LastAltitudeMeters = counters.LastAltitudeMeters;
+                    session.LastGeoidSeparationMeters = counters.LastGeoidSeparationMeters;
+                    session.LastDifferentialAgeSeconds = counters.LastDifferentialAgeSeconds;
+                    session.LastDifferentialStationId = counters.LastDifferentialStationId;
+                    session.StalePositionPeriods = counters.StalePositionPeriods;
+                    session.StreamPausedSeconds = counters.StreamPausedSeconds;
+                    session.PeakPendingBufferCount = counters.PeakPendingBufferCount;
+                }
 
                 await dbContext.SaveChangesAsync(cancellationToken);
 
@@ -1376,6 +1547,24 @@ public class NtripServerService : IHostedService
                     session.MountPointId,
                     session.UserId,
                     $"Rover '{userName}' disconnected (#{session.SerialNumber})");
+
+                await RecordDiagnosticEventAsync(
+                    "RoverDisconnected",
+                    "info",
+                    $"Rover '{userName}' disconnected",
+                    userId: session.UserId,
+                    clientSessionId: session.Id,
+                    mountPointId: session.MountPointId,
+                    dataJson: BuildJson(new Dictionary<string, object?>
+                    {
+                        ["reason"] = disconnectReason,
+                        ["bytesSent"] = session.BytesSent,
+                        ["bytesReceived"] = session.BytesReceived,
+                        ["ggaFrames"] = session.GgaFrameCount,
+                        ["invalidGgaFrames"] = session.InvalidGgaFrameCount,
+                        ["stalePositionPeriods"] = session.StalePositionPeriods
+                    }),
+                    cancellationToken: cancellationToken);
 
                 // Notify SignalR about client disconnection (for real-time dashboard updates)
                 if (!string.IsNullOrEmpty(clientId))
@@ -1439,6 +1628,14 @@ public class NtripServerService : IHostedService
                 mountPoint.Id,
                 null,
                 $"Base station '{mountPointName}' connected");
+
+            await RecordDiagnosticEventAsync(
+                "SourceConnected",
+                "info",
+                $"Base station '{mountPointName}' connected",
+                sourceConnectionId: connection.Id,
+                mountPointId: mountPoint.Id,
+                cancellationToken: cancellationToken);
 
             // Broadcast updated dashboard stats
             await BroadcastDashboardStatsAsync(cancellationToken);
@@ -1513,7 +1710,9 @@ public class NtripServerService : IHostedService
     /// </summary>
     private async Task MarkSourceConnectionDisconnectedAsync(
         string mountPointName,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? sourceId = null,
+        string? disconnectReason = null)
     {
         try
         {
@@ -1533,6 +1732,15 @@ public class NtripServerService : IHostedService
             {
                 connection.DisconnectedAt = DateTime.UtcNow;
                 connection.Status = SourceConnectionStatus.Disconnected;
+                connection.DisconnectReason = disconnectReason;
+
+                if (!string.IsNullOrEmpty(sourceId) && _sourceCounters.TryGetValue(sourceId, out var counters))
+                {
+                    connection.BytesReceived = counters.BytesReceived;
+                    connection.BytesSent = counters.BytesSent;
+                    connection.LastRtcmAt = counters.LastRtcmAt;
+                    connection.RtcmChunkCount = counters.RtcmChunkCount;
+                }
 
                 await dbContext.SaveChangesAsync(cancellationToken);
 
@@ -1546,6 +1754,21 @@ public class NtripServerService : IHostedService
                     connection.MountPointId,
                     null,
                     $"Base station '{mountPointName}' disconnected");
+
+                await RecordDiagnosticEventAsync(
+                    "SourceDisconnected",
+                    "info",
+                    $"Base station '{mountPointName}' disconnected",
+                    sourceConnectionId: connection.Id,
+                    mountPointId: connection.MountPointId,
+                    dataJson: BuildJson(new Dictionary<string, object?>
+                    {
+                        ["reason"] = disconnectReason,
+                        ["bytesReceived"] = connection.BytesReceived,
+                        ["bytesSent"] = connection.BytesSent,
+                        ["rtcmChunks"] = connection.RtcmChunkCount
+                    }),
+                    cancellationToken: cancellationToken);
 
                 // Broadcast updated dashboard stats
                 await BroadcastDashboardStatsAsync(cancellationToken);
@@ -1693,7 +1916,7 @@ public class NtripServerService : IHostedService
                     // Mark session as disconnected in database
                     if (_clientSessionIds.TryGetValue(client.Id, out var sessionId))
                     {
-                        await MarkClientSessionDisconnectedAsync(sessionId, cancellationToken, client.Id);
+                        await MarkClientSessionDisconnectedAsync(sessionId, cancellationToken, client.Id, staleReason);
                         _clientSessionIds.Remove(client.Id);
                     }
 
@@ -1753,7 +1976,7 @@ public class NtripServerService : IHostedService
                         source.Id, source.MountPointName, staleReason);
 
                     // Mark connection as disconnected in database
-                    await MarkSourceConnectionDisconnectedAsync(source.MountPointName, cancellationToken);
+                    await MarkSourceConnectionDisconnectedAsync(source.MountPointName, cancellationToken, source.Id, staleReason);
 
                     anyStaleFound = true;
                 }

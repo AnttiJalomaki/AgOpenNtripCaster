@@ -9,6 +9,7 @@ using AgOpenNtripCaster.Server.Data;
 using AgOpenNtripCaster.Server.Models.Entities;
 using AgOpenNtripCaster.Server.Services.Auth;
 using AgOpenNtripCaster.Server.Services.Data;
+using AgOpenNtripCaster.Server.Services.Diagnostics;
 using AgOpenNtripCaster.Server.Services.Email;
 using AgOpenNtripCaster.Server.Services.NTRIP;
 using AgOpenNtripCaster.Server.Services.Notifications;
@@ -127,6 +128,9 @@ builder.Services.AddScoped<IActivityService, ActivityService>();
 
 // Configure Alert Service
 builder.Services.AddScoped<IAlertService, AlertService>();
+
+// Configure passive diagnostic event service
+builder.Services.AddScoped<IDiagnosticEventService, DiagnosticEventService>();
 
 // Configure Connection Stats Service
 builder.Services.AddSingleton<IConnectionStatsService, ConnectionStatsService>();

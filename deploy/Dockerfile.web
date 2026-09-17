@@ -1,0 +1,28 @@
+# AgOpen Ntripcaster Web Image
+# Builds the React frontend and serves it from nginx.
+
+FROM node:20-alpine AS build
+
+WORKDIR /app
+
+COPY AgOpenNtripCaster.Client/package*.json ./
+RUN npm install --legacy-peer-deps
+
+COPY AgOpenNtripCaster.Client ./
+RUN npm run build
+
+FROM nginx:stable-alpine
+
+RUN rm /etc/nginx/conf.d/default.conf
+
+COPY deploy/nginx/default.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/dist /usr/share/nginx/html
+
+RUN mkdir -p /var/www/certbot && chmod 755 /var/www/certbot
+
+EXPOSE 80 443
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD wget --quiet --tries=1 --spider http://localhost/ || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]
